@@ -38,6 +38,25 @@ import { renderFixedEditorCluster } from "./fixed-editor/cluster.ts";
 import { emergencyTerminalModeReset, TerminalSplitCompositor } from "./fixed-editor/terminal-split.ts";
 import { getDefaultColors } from "./theme.ts";
 import {
+  DEFAULT_SIDEBAR_CONFIG,
+  clearSidebarSubagents,
+  clearSidebarTodos,
+  getSidebarConfig,
+  getSidebarTotalLines,
+  getSidebarWidth as getSidebarWidthFromState,
+  ingestSidebarToolCall,
+  ingestSidebarToolResult,
+  isSidebarEnabled,
+  onSidebarChange,
+  renderSidebarLines,
+  resetSidebarScroll,
+  scrollSidebar,
+  setSidebarConfig,
+  setSidebarContextUsage,
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+} from "./sidebar.ts";
+import {
   isSupportedSuperShortcut,
   matchesConfiguredShortcut,
   shortcutConflictKey,
@@ -853,6 +872,23 @@ function parseBashModeSettings(settings: Record<string, unknown>): BashModeSetti
 // Status Line Builder
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Read sidebar settings from the powerline section of settings.json. */
+function applySidebarSettings(powerlineSetting: unknown): void {
+  if (!isRecord(powerlineSetting)) {
+    setSidebarConfig({ ...DEFAULT_SIDEBAR_CONFIG });
+    return;
+  }
+  const sidebar = isRecord(powerlineSetting.sidebar) ? powerlineSetting.sidebar : null;
+  if (!sidebar) {
+    setSidebarConfig({ ...DEFAULT_SIDEBAR_CONFIG });
+    return;
+  }
+  setSidebarConfig({
+    enabled: typeof sidebar.enabled === "boolean" ? sidebar.enabled : DEFAULT_SIDEBAR_CONFIG.enabled,
+    width: typeof sidebar.width === "number" ? sidebar.width : DEFAULT_SIDEBAR_CONFIG.width,
+  });
+}
+
 /** Render a single segment and return its content with width */
 function renderSegmentWithWidth(
   segId: StatusLineSegmentId,
@@ -957,6 +993,7 @@ function computeResponsiveLayout(
 export default function powerlineFooter(pi: ExtensionAPI) {
   const startupSettings = readSettings();
   config = parsePowerlineConfig(startupSettings.powerline, PRESET_NAMES);
+  applySidebarSettings(startupSettings.powerline);
   let resolvedShortcuts = resolveShortcutConfig(startupSettings);
   let bashModeSettings = parseBashModeSettings(startupSettings);
 
@@ -1224,6 +1261,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     resolvedShortcuts = resolveShortcutConfig(settings);
     showLastPrompt = settings.showLastPrompt !== false;
     config = parsePowerlineConfig(settings.powerline, PRESET_NAMES);
+    applySidebarSettings(settings.powerline);
     stashedPromptHistory = readPersistedStashHistory();
     bashModeActive = false;
     bashTranscript = new BashTranscriptStore(bashModeSettings);
@@ -1312,6 +1350,10 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         // Small delay to let git update, then re-render
         setTimeout(() => requestStatusRender(), 100);
       }
+    }
+    const isError = Boolean((event as any)?.isError ?? (event as any)?.error);
+    if (ingestSidebarToolResult(event.toolName, (event as any)?.result, isError)) {
+      requestImmediateStatusRender({ deferDuringTyping: false });
     }
   });
 
@@ -1402,6 +1444,9 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       // Extract recent agent context from session for richer vibe generation
       const agentContext = getRecentAgentContext(ctx);
       onVibeToolCall(event.toolName, event.input, ctx.ui.setWorkingMessage, agentContext);
+    }
+    if (ingestSidebarToolCall(event.toolName, event.input)) {
+      requestImmediateStatusRender({ deferDuringTyping: false });
     }
   });
   
@@ -1821,6 +1866,66 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       // Show available presets
       const presetList = Object.keys(PRESETS).join(", ");
       ctx.ui.notify(`Available presets: ${presetList}`, "info");
+    },
+  });
+
+  // Re-render whenever sidebar state mutates so the user sees todos / context
+  // updates without waiting for the next agent event.
+  onSidebarChange(() => {
+    if (isSidebarEnabled()) {
+      requestImmediateStatusRender({ deferDuringTyping: false });
+    }
+  });
+
+  pi.registerCommand("sidebar", {
+    description: "Toggle right-side sidebar (context, todos, subagents). Usage: /sidebar [on|off|width <n>|clear]",
+    handler: async (args, ctx) => {
+      currentCtx = ctx;
+      const arg = (args ?? "").trim().toLowerCase();
+      const cfg = getSidebarConfig();
+
+      if (!arg || arg === "toggle") {
+        setSidebarConfig({ enabled: !cfg.enabled });
+        ctx.ui.notify(`Sidebar ${getSidebarConfig().enabled ? "enabled" : "disabled"}`, "info");
+      } else if (arg === "on" || arg === "enable") {
+        setSidebarConfig({ enabled: true });
+        ctx.ui.notify("Sidebar enabled", "info");
+      } else if (arg === "off" || arg === "disable") {
+        setSidebarConfig({ enabled: false });
+        ctx.ui.notify("Sidebar disabled", "info");
+      } else if (arg.startsWith("width")) {
+        const n = parseInt(arg.replace(/^width\s*/, ""), 10);
+        if (!Number.isFinite(n)) {
+          ctx.ui.notify(`Sidebar width must be ${SIDEBAR_MIN_WIDTH}–${SIDEBAR_MAX_WIDTH}`, "warning");
+          return;
+        }
+        setSidebarConfig({ width: n, enabled: true });
+        ctx.ui.notify(`Sidebar width: ${getSidebarConfig().width}`, "info");
+      } else if (arg === "clear" || arg === "reset") {
+        clearSidebarTodos();
+        clearSidebarSubagents();
+        resetSidebarScroll();
+        ctx.ui.notify("Sidebar cleared", "info");
+      } else if (arg === "top") {
+        resetSidebarScroll();
+      } else if (arg === "down") {
+        scrollSidebar(5, 1, getSidebarTotalLines());
+      } else if (arg === "up") {
+        scrollSidebar(-5, 1, getSidebarTotalLines());
+      } else {
+        ctx.ui.notify("Usage: /sidebar [on|off|toggle|width <n>|clear|up|down|top]", "info");
+      }
+
+      // Persist into settings under powerline.sidebar so the choice survives.
+      writePowerlineSetting(ctx.cwd, (existing) => {
+        const base = isRecord(existing) ? { ...existing } : {};
+        base.sidebar = { ...DEFAULT_SIDEBAR_CONFIG, ...getSidebarConfig() };
+        return base;
+      });
+
+      // Force the compositor to repaint with the new column allocation.
+      forceNextLayoutRecompute = true;
+      tuiRef?.requestRender(true);
     },
   });
 
@@ -2344,6 +2449,20 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       },
       onCopySelection: (text) => copyTextToClipboard(ctx, text),
       getShowHardwareCursor: () => typeof tui.getShowHardwareCursor === "function" && tui.getShowHardwareCursor(),
+      getSidebarWidth: () => getSidebarWidthFromState(),
+      renderSidebar: (rows, width) => {
+        // Refresh context usage from the live ctx on every paint so the bar
+        // tracks streaming usage without separate scheduling.
+        const usage = readCoreContextUsage(currentCtx);
+        if (usage) {
+          setSidebarContextUsage(usage.contextTokens, usage.contextWindow, usage.contextPercent);
+        }
+        return renderSidebarLines({ rows, width });
+      },
+      onSidebarScroll: (delta, viewportRows) => {
+        scrollSidebar(delta, viewportRows, getSidebarTotalLines());
+        compositor.requestRepaint();
+      },
       renderCluster: (width, terminalRows) => {
         const theme = readRenderTheme();
         const statusContainerLines = fixedStatusContainer

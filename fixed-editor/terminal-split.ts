@@ -22,6 +22,18 @@ interface TerminalSplitCompositorOptions {
   mouseScroll?: boolean;
   keyboardScrollShortcuts?: KeyboardScrollShortcuts;
   onCopySelection?: (text: string) => void;
+  /** Returns the desired sidebar width in cells, or 0 to disable. */
+  getSidebarWidth?: () => number;
+  /**
+   * Render `rows` sidebar lines, each visible-width === `width`. Called from
+   * the compositor's main paint paths.
+   */
+  renderSidebar?: (rows: number, width: number) => string[];
+  /**
+   * Optional callback the compositor invokes when the user scrolls inside the
+   * sidebar region with the mouse wheel. delta>0 scrolls down.
+   */
+  onSidebarScroll?: (delta: number, viewportRows: number) => void;
 }
 
 interface PatchedRenderable {
@@ -331,6 +343,12 @@ export class TerminalSplitCompositor {
   private readonly mouseScroll: boolean;
   private readonly keyboardScrollShortcuts: KeyboardScrollShortcuts;
   private readonly onCopySelection: ((text: string) => void) | null;
+  private readonly getSidebarWidthOpt: (() => number) | null;
+  private readonly renderSidebarOpt: ((rows: number, width: number) => string[]) | null;
+  private readonly onSidebarScroll: ((delta: number, viewportRows: number) => void) | null;
+  private columnsDescriptor: PropertyDescriptor | undefined;
+  private cachedSidebarWidth = 0;
+  private cachedTotalColumns = 0;
   private extendedKeyboardMode: ExtendedKeyboardMode | null = null;
   private readonly rowsDescriptor: PropertyDescriptor | undefined;
   private readonly originalWrite: (data: string) => void;
@@ -374,7 +392,12 @@ export class TerminalSplitCompositor {
     this.mouseScroll = options.mouseScroll !== false;
     this.keyboardScrollShortcuts = options.keyboardScrollShortcuts ?? DEFAULT_KEYBOARD_SCROLL_SHORTCUTS;
     this.onCopySelection = options.onCopySelection ?? null;
+    this.getSidebarWidthOpt = options.getSidebarWidth ?? null;
+    this.renderSidebarOpt = options.renderSidebar ?? null;
+    this.onSidebarScroll = options.onSidebarScroll ?? null;
     this.rowsDescriptor = descriptorForRows(options.terminal);
+    this.columnsDescriptor = Object.getOwnPropertyDescriptor(options.terminal, "columns")
+      ?? Object.getOwnPropertyDescriptor(Object.getPrototypeOf(options.terminal), "columns");
     this.originalWrite = options.terminal.write.bind(options.terminal);
     this.originalDoRender = typeof options.tui.doRender === "function" ? options.tui.doRender.bind(options.tui) : null;
     this.originalRender = typeof options.tui.render === "function" ? options.tui.render.bind(options.tui) : null;
@@ -405,6 +428,30 @@ export class TerminalSplitCompositor {
       configurable: true,
       get: () => this.getScrollableRows(),
     });
+
+    if (this.getSidebarWidthOpt) {
+      // Override columns getter so the rest of the renderer naturally lays out
+      // content for the narrower content area. We expose getRawColumns() for
+      // sidebar paint code that needs the true terminal width.
+      const rawColumnsGetter = (): number => {
+        if (this.columnsDescriptor && typeof this.columnsDescriptor.get === "function") {
+          return Number(this.columnsDescriptor.get.call(this.terminal)) || 80;
+        }
+        return Number(this.columnsDescriptor?.value) || 80;
+      };
+      Object.defineProperty(this.terminal, "columns", {
+        configurable: true,
+        get: () => {
+          const total = rawColumnsGetter();
+          this.cachedTotalColumns = total;
+          const sidebar = Math.max(0, this.getSidebarWidthOpt!() | 0);
+          // Never let the sidebar consume more than half of the screen.
+          const clamped = Math.min(sidebar, Math.max(0, total - 20));
+          this.cachedSidebarWidth = clamped;
+          return Math.max(1, total - clamped);
+        },
+      });
+    }
 
     if (this.originalRender) {
       this.tui.render = (width: number) => this.renderScrollableRoot(width);
@@ -516,10 +563,37 @@ export class TerminalSplitCompositor {
       beginSynchronizedOutput()
       + disableAutoWrap()
       + buildFixedClusterPaint(this.decorateCluster(cluster), rawRows, width, this.getShowHardwareCursor())
+      + this.buildSidebarPaint(rawRows, width)
       + enableAutoWrap()
       + this.mouseReportingStateGuard()
       + endSynchronizedOutput(),
     );
+  }
+
+  /**
+   * Build the bytes that paint the sidebar on the right edge. We rely on the
+   * fact that buildFixedClusterPaint / repaintScrollableViewport already used
+   * `terminal.columns` (which we narrowed) to truncate every line, so the
+   * rightmost columns are clean and ready for us to draw into.
+   */
+  private buildSidebarPaint(rawRows: number, contentWidth: number): string {
+    if (!this.renderSidebarOpt || this.cachedSidebarWidth <= 0) return "";
+    const sidebarWidth = this.cachedSidebarWidth;
+    const rows = Math.max(1, rawRows);
+    const lines = this.renderSidebarOpt(rows, sidebarWidth);
+    if (!lines || lines.length === 0) return "";
+    const startCol = contentWidth + 1;
+    let buffer = resetScrollRegion();
+    for (let i = 0; i < rows && i < lines.length; i++) {
+      buffer += moveCursor(i + 1, startCol);
+      // Sanitize to exact width so it never spills into other rows.
+      const line = lines[i] ?? "";
+      buffer += sanitizeLine(line, sidebarWidth);
+      // Pad with spaces if shorter (preserves background).
+      const w = visibleWidth(line);
+      if (w < sidebarWidth) buffer += " ".repeat(sidebarWidth - w);
+    }
+    return buffer;
   }
 
   dispose(options: DisposeOptions = {}): void {
@@ -560,6 +634,13 @@ export class TerminalSplitCompositor {
       Object.defineProperty(this.terminal, "rows", this.rowsDescriptor);
     } else {
       Reflect.deleteProperty(this.terminal, "rows");
+    }
+    if (this.getSidebarWidthOpt) {
+      if (this.columnsDescriptor) {
+        Object.defineProperty(this.terminal, "columns", this.columnsDescriptor);
+      } else {
+        Reflect.deleteProperty(this.terminal, "columns");
+      }
     }
 
     this.restoreTerminalState(options);
@@ -915,6 +996,7 @@ export class TerminalSplitCompositor {
     }
 
     buffer += buildFixedClusterPaint(this.decorateCluster(cluster), rawRows, width, this.getShowHardwareCursor());
+    buffer += this.buildSidebarPaint(rawRows, width);
     buffer += enableAutoWrap();
     buffer += this.mouseReportingStateGuard();
     buffer += endSynchronizedOutput();
